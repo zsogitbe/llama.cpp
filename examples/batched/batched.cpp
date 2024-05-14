@@ -48,6 +48,8 @@ int main(int argc, char ** argv) {
         params.prompt = "Hello my name is";
     }
 
+    process_escapes(params.prompt);
+
     // init LLM
 
     llama_backend_init();
@@ -78,9 +80,9 @@ int main(int argc, char ** argv) {
     llama_context_params ctx_params = llama_context_default_params();
 
     ctx_params.seed  = 1234;
-    ctx_params.n_ctx = n_kv_req;
+    ctx_params.n_ctx   = n_kv_req;
     ctx_params.n_batch = std::max(n_len, n_parallel);
-    ctx_params.n_parallel      = n_parallel;
+    ctx_params.n_seq_max       = n_parallel;
     ctx_params.n_threads       = params.n_threads;
     ctx_params.n_threads_batch = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
 
@@ -189,8 +191,8 @@ int main(int argc, char ** argv) {
 
             //const llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
 
-            // is it an end of stream? -> mark the stream as finished
-            if (new_token_id == llama_token_eos(model) || n_cur == n_len) {
+            // is it an end of generation? -> mark the stream as finished
+            if (llama_token_is_eog(model, new_token_id) || n_cur == n_len) {
                 i_batch[i] = -1;
                 LOG_TEE("\n");
                 if (n_parallel > 1) {
