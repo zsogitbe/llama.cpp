@@ -12,7 +12,7 @@ FROM ${BASE_CUDA_DEV_CONTAINER} as build
 ARG CUDA_DOCKER_ARCH=all
 
 RUN apt-get update && \
-    apt-get install -y build-essential git
+    apt-get install -y build-essential git libcurl4-openssl-dev
 
 WORKDIR /app
 
@@ -22,11 +22,16 @@ COPY . .
 ENV CUDA_DOCKER_ARCH=${CUDA_DOCKER_ARCH}
 # Enable CUDA
 ENV LLAMA_CUDA=1
+# Enable cURL
+ENV LLAMA_CURL=1
 
-RUN make -j$(nproc)
+RUN make -j$(nproc) llama-server
 
 FROM ${BASE_CUDA_RUN_CONTAINER} as runtime
 
-COPY --from=build /app/main /main
+RUN apt-get update && \
+    apt-get install -y libcurl4-openssl-dev libgomp1
 
-ENTRYPOINT [ "/main" ]
+COPY --from=build /app/llama-server /llama-server
+
+ENTRYPOINT [ "/llama-server" ]

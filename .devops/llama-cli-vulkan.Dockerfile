@@ -3,7 +3,7 @@ ARG UBUNTU_VERSION=jammy
 FROM ubuntu:$UBUNTU_VERSION as build
 
 # Install build tools
-RUN apt update && apt install -y git build-essential cmake wget
+RUN apt update && apt install -y git build-essential cmake wget libgomp1
 
 # Install Vulkan SDK
 RUN wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | apt-key add - && \
@@ -15,13 +15,13 @@ RUN wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | apt-key 
 WORKDIR /app
 COPY . .
 RUN cmake -B build -DLLAMA_VULKAN=1 && \
-    cmake --build build --config Release --target main
+    cmake --build build --config Release --target llama-cli
 
 # Clean up
 WORKDIR /
-RUN cp /app/build/bin/main /main && \
+RUN cp /app/build/bin/llama-cli /llama-cli && \
     rm -rf /app
 
 ENV LC_ALL=C.utf8
 
-ENTRYPOINT [ "/main" ]
+ENTRYPOINT [ "/llama-cli" ]
