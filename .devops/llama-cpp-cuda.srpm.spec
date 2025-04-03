@@ -17,10 +17,10 @@ Version:        %( date "+%%Y%%m%%d" )
 Release:        1%{?dist}
 Summary:        CPU Inference of LLaMA model in pure C/C++ (no CUDA/OpenCL)
 License:        MIT
-Source0:        https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.tar.gz
+Source0:        https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.tar.gz
 BuildRequires:  coreutils make gcc-c++ git cuda-toolkit
 Requires:       cuda-toolkit
-URL:            https://github.com/ggerganov/llama.cpp
+URL:            https://github.com/ggml-org/llama.cpp
 
 %define debug_package %{nil}
 %define source_date_epoch_from_changelog 0
@@ -32,7 +32,7 @@ CPU inference for Meta's Lllama2 models using default options.
 %setup -n llama.cpp-master
 
 %build
-make -j LLAMA_CUDA=1
+make -j GGML_CUDA=1
 
 %install
 mkdir -p %{buildroot}%{_bindir}/
