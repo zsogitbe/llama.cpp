@@ -2,7 +2,6 @@
 #    undef NDEBUG
 #endif
 
-#include "unicode.h"
 #include "sampling.h"
 
 #include <cassert>
@@ -84,7 +83,7 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
 
             fprintf(stderr,
                     "\n NOTE: Debug grammar file generated. To analyze this failure in detail, run the following "
-                    "command:     ./llama-gbnf-validator test-grammar-integration.grammar.gbnf "
+                    "command:     ./test-gbnf-validator test-grammar-integration.grammar.gbnf "
                     "test-grammar-integration.string.txt\n\n");
         } else {
             fprintf(stdout, "✅︎\n");
@@ -1196,6 +1195,9 @@ int main(int argc, const char ** argv) {
     test_json_schema();
 
     test_sampler_chain();
+
+    llama_free(ctx);
+    llama_model_free(model);
 
     fprintf(stdout, "All tests passed.\n");
     return 0;

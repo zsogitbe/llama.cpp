@@ -14,6 +14,7 @@
 #define GGML_SYCL_DEQUANTIZE_HPP
 
 #include "common.hpp"
+#include "convert.hpp"
 
 typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int iqs, dfloat2 & v);
 typedef void (*dequantize_kernel_t_reorder)(const void *d, const int64_t ib, const void *qs,
@@ -143,6 +144,22 @@ static __dpct_inline__ void dequantize_q5_1(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+static __dpct_inline__ void dequantize_q8_0_reorder(const void *d_ptr, const int64_t ib, const void *qs,
+                                            const int iqs, dfloat2 &v) {
+    const dfloat d = (const dfloat)*((const sycl::half*)d_ptr + ib);
+
+    v.x() = ((const int8_t *)qs)[iqs + 0];
+    v.y() = ((const int8_t *)qs)[iqs + 1];
+
+#ifdef GGML_SYCL_F16
+    v.s0() *= d;
+    v.s1() *= d;
+#else
+    v.x() *= d;
+    v.y() *= d;
+#endif // GGML_SYCL_F16
+}
+
 static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
@@ -218,6 +235,34 @@ static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * 
         int vq = qs[l];
         y_ptr[l + 0] = d * ((vq & 0xF) - 8);
         y_ptr[l + 16] = d * ((vq >> 4) - 8);
+    }
+
+}
+
+// Dequantize Q8_0 from reorder layout: [all qs (k bytes)][all d values]
+// Each thread handles one block of QK8_0 elements.
+template<typename dst_t>
+static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                  const sycl::nd_item<3> &item_ct1) {
+
+    const int64_t i = item_ct1.get_group(2);
+    const int64_t tid = item_ct1.get_local_id(2);
+    const int lane_ib = i * WARP_SIZE + tid;
+
+    if (lane_ib >= k / QK8_0) {
+        return;
+    }
+
+    dst_t * y_ptr = yy + lane_ib * QK8_0;
+
+    auto qs = (const int8_t*)vx + lane_ib * QK8_0;
+    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k) + lane_ib;
+
+    const float d = float(*s_ptr);
+
+#pragma unroll
+    for (int l = 0; l < QK8_0; ++l) {
+        y_ptr[l] = d * qs[l];
     }
 
 }
@@ -357,6 +402,28 @@ static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8
 }
 #endif
 
+template <typename dst_t>
+inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __restrict__ qs_ptr, const float dall,
+                                   const float dmin, uint8_t * __restrict__ scales_local, int il, int ir) {
+    const int is = 2 * il;
+    constexpr int n  = 4;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, scales_local, sc, m);
+    const float d1 = dall * sc;
+    const float m1 = dmin * m;
+
+    get_scale_min_k4(is + 1, scales_local, sc, m);
+    const float d2 = dall * sc;
+    const float m2 = dmin * m;
+
+    sycl::vec<uint8_t, n> q_vec = vec_aligned_load<uint8_t, n>(qs_ptr + 32 * il + n * ir);
+    for (int l = 0; l < n; ++l) {
+        y[l + 0]  = d1 * (q_vec[l] & 0xF) - m1;
+        y[l + 32] = d2 * (q_vec[l] >> 4) - m2;
+    }
+}
+
 template<typename dst_t>
 static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                   uint8_t* scales_local, const sycl::nd_item<3> &item_ct1) {
@@ -365,36 +432,22 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const int64_t i = item_ct1.get_group(2);
 
 #if QK_K == 256
-    // assume 32 threads
     const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t il  = tid/8;
-    const int64_t ir  = tid%8;
-    const int64_t is  = 2*il;
-    const int64_t n   = 4;
+    const int64_t il  = tid / 8;
+    const int64_t ir  = tid % 8;
 
-    dst_t * y = yy + i*QK_K + 64*il + n*ir;
+    dst_t * y = yy + i * QK_K + 64 * il + 4 * ir;
 
     const sycl::half2 dm = x[i].dm;
     const float dall = dm[0];
     const float dmin = dm[1];
 
-    if (tid < 12)
+    if (tid < 12) {
         scales_local[tid] = x[i].scales[tid];
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    uint8_t sc, m;
-    get_scale_min_k4(is + 0, scales_local, sc, m);
-    const float d1 = dall * sc;
-    const float m1 = dmin * m;
-    get_scale_min_k4(is + 1, scales_local, sc, m);
-    const float d2 = dall * sc;
-    const float m2 = dmin * m;
-
-    sycl::vec<uint8_t, n> q_vec = vec_aligned_load<uint8_t, n>(x[i].qs + 32*il + n*ir);
-    for (int l = 0; l < n; ++l) {
-        y[l + 0] = d1 * (q_vec[l] & 0xF) - m1;
-        y[l +32] = d2 * (q_vec[l] >>  4) - m2;
     }
+
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    dequantize_q4_K_common(y, x[i].qs, dall, dmin, scales_local, il, ir);
 #else
     const int64_t tid = item_ct1.get_local_id(2);
     const uint8_t * q = x[i].qs;
@@ -404,6 +457,36 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     y[tid+ 0] = d * (x[i].scales[0] & 0xF) * (q[tid] & 0xF) - m * (x[i].scales[0] >> 4);
     y[tid+32] = d * (x[i].scales[1] & 0xF) * (q[tid] >>  4) - m * (x[i].scales[1] >> 4);
 #endif
+}
+
+template <typename dst_t>
+static void dequantize_block_q4_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, uint8_t * scales_local,
+                                          const sycl::nd_item<1> & item_ct1, int64_t nb) {
+    const int64_t i   = item_ct1.get_group(0);     // block index
+    const int64_t tid = item_ct1.get_local_id(0);  // thread index within block
+    const int64_t il  = tid / 8;
+    const int64_t ir  = tid % 8;
+
+    dst_t * y = yy + i * QK_K + 64 * il + 4 * ir;
+
+    const uint8_t * base          = static_cast<const uint8_t *>(vx);
+    const size_t    qs_offset     = i * (QK_K / 2);
+    const size_t    scales_offset = nb * (QK_K / 2) + i * K_SCALE_SIZE;
+    const size_t    dm_offset     = nb * (QK_K / 2) + nb * K_SCALE_SIZE + i * sizeof(ggml_half2);
+
+    const uint8_t *    qs_ptr     = base + qs_offset;
+    const uint8_t *    scales_ptr = base + scales_offset;
+    ggml_half2         dm_values  = *reinterpret_cast<const ggml_half2 *>(base + dm_offset);
+
+    const float dall = dm_values.x();
+    const float dmin = dm_values.y();
+
+    if (tid < 12) {
+        scales_local[tid] = scales_ptr[tid];
+    }
+
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    dequantize_q4_K_common(y, qs_ptr, dall, dmin, scales_local, il, ir);
 }
 
 template<typename dst_t>
@@ -498,6 +581,38 @@ static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restri
     y[ 0] = d * sc[ip+0] * ((int8_t)((ql & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
     y[32] = d * sc[ip+2] * ((int8_t)((ql  >> 4) | (((qh >> 4) & 3) << 4)) - 32);
 #endif
+}
+
+template <typename dst_t>
+static void dequantize_block_q6_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                          const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
+    const int64_t ib = item_ct1.get_group(2);
+
+    const int64_t tid = item_ct1.get_local_id(2);
+    const int64_t ip  = tid / 32;       // ip is 0 or 1
+    const int64_t il  = tid - 32 * ip;  // 0...32
+    const int64_t is  = 8 * ip + il / 16;
+
+    const uint8_t *   base_ptr           = static_cast<const uint8_t *>(vx);
+    const auto        ql_offset          = ib * (QK_K / 2);
+    const auto        qh_offset          = (QK_K / 2) * n_blocks + (QK_K / 4) * ib;
+    const auto        base_scales_offset = (QK_K / 2) * n_blocks + (QK_K / 4) * n_blocks + (QK_K / 16) * ib;
+    const auto        base_d_offset      = ((QK_K / 2) + (QK_K / 4) + (QK_K / 16)) * n_blocks;
+    const uint8_t *   ql_ptr             = base_ptr + ql_offset;
+    const uint8_t *   qh_ptr             = base_ptr + qh_offset;
+    const uint8_t *   scales_ptr         = base_ptr + base_scales_offset;
+    const ggml_half * d                  = (const ggml_half *) (base_ptr + base_d_offset) + ib;
+
+    dst_t * y = yy + ib * QK_K + 128 * ip + il;
+
+    const uint8_t * ql = ql_ptr + 64 * ip + il;
+    const uint8_t   qh = *(qh_ptr + 32 * ip + il);
+    const int8_t *  sc = reinterpret_cast<const int8_t *>(scales_ptr + is);
+
+    y[0]  = *d * sc[0] * ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+    y[32] = *d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+    y[64] = *d * sc[4] * ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+    y[96] = *d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32);
 }
 
 template<typename dst_t>
@@ -747,6 +862,56 @@ dequantize_block_iq4_xs(const void *__restrict__ vx, dst_t *__restrict__ yy,
         y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
         y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
     }
+}
+
+template<typename dst_t>
+static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                   const sycl::nd_item<3> &item_ct1) {
+    // auto                item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t       i        = item_ct1.get_group(2);
+    const block_mxfp4 * x = (const block_mxfp4 *) vx + i*(QK_K/QK_MXFP4);
+
+    const int64_t    tid = item_ct1.get_local_id(2);
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[ib].qs + 4*il;
+    const float d = ggml_sycl_e8m0_to_fp32(x[ib].e);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_mxfp4[q4[j] & 0xf]*0.5f;
+        y[j+16] = d * kvalues_mxfp4[q4[j] >>  4]*0.5f;
+    }
+}
+
+
+template <typename dst_t>
+static void dequantize_block_nvfp4(
+        const void * __restrict__ vx,
+        dst_t * __restrict__ yy,
+        const int64_t ne) {
+    auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i        = item_ct1.get_group(2);
+    const int     tid      = item_ct1.get_local_id(2);
+
+    const int64_t base = i * QK_NVFP4;
+    if (base >= ne) {
+        return;
+    }
+
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+    const block_nvfp4 & xb = x[i];
+
+    const int sub = tid / (QK_NVFP4_SUB / 2);
+    const int j = tid % (QK_NVFP4_SUB / 2);
+
+    const float d = ggml_sycl_ue4m3_to_fp32(xb.d[sub]);
+    const uint8_t q = xb.qs[sub * (QK_NVFP4_SUB / 2) + j];
+
+    const int64_t y0 = base + sub * QK_NVFP4_SUB + j;
+    const int64_t y1 = y0 + QK_NVFP4_SUB / 2;
+
+    yy[y0] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
+    yy[y1] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
 }
 
 
