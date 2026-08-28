@@ -203,8 +203,11 @@ int32_t llama_speculative_decode(struct llama_speculative_context * spec_ctx,
             pair.second.batch_idx  = spec_ctx->batch_dft.n_tokens;
 
             if (spec_ctx->params.is_mtp) {
+                // Instead, stop incrementing the position (+ i). Since MTP projection heads
+                // are stateless and don't write to the KV cache, the cache position remains
+                // frozen. Passing 'current_pos' for every draft token satisfies the Y = X + 1 check.
                 spec_batch_add_mtp(&spec_ctx->batch_dft, draft_base, pair.second.h_row.data(), n_embd,
-                                   pair.second.current_pos + i, { pair.first }, true);
+                                   pair.second.current_pos, { pair.first }, true);
             } else {
                 spec_batch_add(&spec_ctx->batch_dft, draft_base, pair.second.current_pos + i, { pair.first }, true);
             }
