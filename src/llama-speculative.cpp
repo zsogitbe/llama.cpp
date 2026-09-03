@@ -129,16 +129,35 @@ int32_t llama_speculative_decode(struct llama_speculative_context * spec_ctx,
         llama_set_embeddings_nextn(spec_ctx->ctx_tgt, true, false);
     }
 
+    // 1.A Vision & prefill detection
+    const bool is_embd_batch = (batch->embd != nullptr) || (batch->token == nullptr);
+
+    bool has_logits = false;
+    if (batch->logits != nullptr) {
+        for (int32_t i = 0; i < batch->n_tokens; ++i) {
+            if (batch->logits[i]) {
+                has_logits = true;
+                break;
+            }
+        }
+    }
+
     // 2. Evaluate target context on incoming batch (Prompt or accepted tokens)
     if (llama_decode(spec_ctx->ctx_tgt, *batch) != 0) {
         return 0;
     }
 
-    // Synchronize the draft context KV cache with the incoming batch
-    if (spec_ctx->ctx_dft && spec_ctx->ctx_dft != spec_ctx->ctx_tgt && !spec_ctx->params.is_mtp) {
+    // 2.A Synchronize the draft context KV cache with the incoming batch
+    if (!is_embd_batch && spec_ctx->ctx_dft && spec_ctx->ctx_dft != spec_ctx->ctx_tgt && !spec_ctx->params.is_mtp) {
         if (llama_decode(spec_ctx->ctx_dft, *batch) != 0) {
             return 0;
         }
+    }
+
+    // 2.B. Early exit for vision bypass
+    if (is_embd_batch || !has_logits) {
+        // The batch was successfully processed into the KV cache, but no generation is needed yet.
+        return 0;
     }
 
     // 3. Identify active sequences from batch and extract their sampled base token
@@ -154,7 +173,11 @@ int32_t llama_speculative_decode(struct llama_speculative_context * spec_ctx,
         }
     }
 
-    const int32_t n_embd = spec_ctx->params.is_mtp ? llama_model_n_embd_out(llama_get_model(spec_ctx->ctx_tgt)) : 0;
+    const struct llama_model * tgt_model = llama_get_model(spec_ctx->ctx_tgt);
+    const int32_t n_embd    = spec_ctx->params.is_mtp ? llama_model_n_embd_out(tgt_model) : 0;
+
+    // Evaluate if the model uses recurrent states that prohibit zero-copy rollback
+    bool is_rnn = llama_model_is_recurrent(tgt_model) || llama_model_is_hybrid(tgt_model);
 
     for (auto & pair : active_seqs) {
         // Evaluate native sampler chain (must be greedy) to get the base diverging token
@@ -173,15 +196,18 @@ int32_t llama_speculative_decode(struct llama_speculative_context * spec_ctx,
             }
         }
 
-        // Unconditional byte-level backup of the mathematical state. Crucial for M-RoPE/RNN hybrid architectures.
-        size_t tgt_size = llama_state_seq_get_size(spec_ctx->ctx_tgt, pair.first);
-        pair.second.ckpt_tgt.resize(tgt_size);
-        llama_state_seq_get_data(spec_ctx->ctx_tgt, pair.second.ckpt_tgt.data(), tgt_size, pair.first);
+        // Byte-level backups are strictly isolated to recurrent architectures now
+        if (is_rnn) {
+            // Unconditional byte-level backup of the mathematical state. Crucial for M-RoPE/RNN hybrid architectures.
+            size_t tgt_size = llama_state_seq_get_size(spec_ctx->ctx_tgt, pair.first);
+            pair.second.ckpt_tgt.resize(tgt_size);
+            llama_state_seq_get_data(spec_ctx->ctx_tgt, pair.second.ckpt_tgt.data(), tgt_size, pair.first);
 
-        if (spec_ctx->ctx_dft && !spec_ctx->params.is_mtp) {
-            size_t dft_size = llama_state_seq_get_size(spec_ctx->ctx_dft, pair.first);
-            pair.second.ckpt_dft.resize(dft_size);
-            llama_state_seq_get_data(spec_ctx->ctx_dft, pair.second.ckpt_dft.data(), dft_size, pair.first);
+            if (spec_ctx->ctx_dft && !spec_ctx->params.is_mtp) {
+                size_t dft_size = llama_state_seq_get_size(spec_ctx->ctx_dft, pair.first);
+                pair.second.ckpt_dft.resize(dft_size);
+                llama_state_seq_get_data(spec_ctx->ctx_dft, pair.second.ckpt_dft.data(), dft_size, pair.first);
+            }
         }
     }
 
@@ -203,7 +229,7 @@ int32_t llama_speculative_decode(struct llama_speculative_context * spec_ctx,
             pair.second.batch_idx  = spec_ctx->batch_dft.n_tokens;
 
             if (spec_ctx->params.is_mtp) {
-                // Instead, stop incrementing the position (+ i). Since MTP projection heads
+                // Do not increment the position (+ i). Since MTP projection heads
                 // are stateless and don't write to the KV cache, the cache position remains
                 // frozen. Passing 'current_pos' for every draft token satisfies the Y = X + 1 check.
                 spec_batch_add_mtp(&spec_ctx->batch_dft, draft_base, pair.second.h_row.data(), n_embd,
@@ -289,42 +315,56 @@ int32_t llama_speculative_decode(struct llama_speculative_context * spec_ctx,
 
             // KV Cache Rollback & State Recovery for rejected tokens
             if (accepted < (int32_t) n_drafted) {
-                llama_memory_t mem_tgt = llama_get_memory(spec_ctx->ctx_tgt);
+                if (!is_rnn) {
+                    // ZERO-COPY ROLLBACK (Transformers)
+                    // The KV cache holds the base token + all evaluated draft tokens. Truncate rejected tokens instantly.
+                    llama_memory_t mem_tgt = llama_get_memory(spec_ctx->ctx_tgt);
+                    llama_memory_seq_rm(mem_tgt, pair.first, pair.second.current_pos + accepted + 1, -1);
 
-                // 1. Wipe invalid KV cache and restore exact state prior to verification
-                llama_memory_seq_rm(mem_tgt, pair.first, pair.second.current_pos, -1);
-                llama_state_seq_set_data(spec_ctx->ctx_tgt, pair.second.ckpt_tgt.data(), pair.second.ckpt_tgt.size(),
-                                         pair.first);
+                    if (spec_ctx->ctx_dft && !spec_ctx->params.is_mtp) {
+                        llama_memory_t mem_dft = llama_get_memory(spec_ctx->ctx_dft);
+                        llama_memory_seq_rm(mem_dft, pair.first, pair.second.current_pos + accepted + 1, -1);
+                    }
+                } else {
+                    // FALLBACK FOR RNNs & HYBRIDs
+                    llama_memory_t mem_tgt = llama_get_memory(spec_ctx->ctx_tgt);
 
-                // 2. Re-decode the base token + accepted draft tokens to safely catch the RNN Math up to speed
-                int32_t     redecode_count = 1 + accepted;
-                llama_batch fix_batch      = llama_batch_init(redecode_count, 0, 1);
-                spec_batch_add(&fix_batch, pair.second.current_token, pair.second.current_pos, { pair.first }, true);
+                    // 1. Wipe invalid KV cache and restore exact state prior to verification
+                    llama_memory_seq_rm(mem_tgt, pair.first, pair.second.current_pos, -1);
+                    llama_state_seq_set_data(spec_ctx->ctx_tgt, pair.second.ckpt_tgt.data(),
+                                             pair.second.ckpt_tgt.size(), pair.first);
 
-                for (int i = 0; i < accepted; i++) {
-                    spec_batch_add(&fix_batch, pair.second.draft_tokens[i], pair.second.current_pos + i + 1,
-                                   { pair.first }, true);
-                }
-                llama_decode(spec_ctx->ctx_tgt, fix_batch);
-                llama_batch_free(fix_batch);
-
-                // 3. Do the same for the draft context ONLY if using standard speculation
-                if (spec_ctx->ctx_dft && !spec_ctx->params.is_mtp) {
-                    llama_memory_t mem_dft = llama_get_memory(spec_ctx->ctx_dft);
-                    llama_memory_seq_rm(mem_dft, pair.first, pair.second.current_pos, -1);
-                    llama_state_seq_set_data(spec_ctx->ctx_dft, pair.second.ckpt_dft.data(),
-                                             pair.second.ckpt_dft.size(), pair.first);
-
-                    llama_batch fix_batch_dft = llama_batch_init(redecode_count, 0, 1);
-                    spec_batch_add(&fix_batch_dft, pair.second.current_token, pair.second.current_pos, { pair.first },
+                    // 2. Re-decode the base token + accepted draft tokens to safely catch the RNN Math up to speed
+                    int32_t     redecode_count = 1 + accepted;
+                    llama_batch fix_batch      = llama_batch_init(redecode_count, 0, 1);
+                    spec_batch_add(&fix_batch, pair.second.current_token, pair.second.current_pos, { pair.first },
                                    true);
 
                     for (int i = 0; i < accepted; i++) {
-                        spec_batch_add(&fix_batch_dft, pair.second.draft_tokens[i], pair.second.current_pos + i + 1,
+                        spec_batch_add(&fix_batch, pair.second.draft_tokens[i], pair.second.current_pos + i + 1,
                                        { pair.first }, true);
                     }
-                    llama_decode(spec_ctx->ctx_dft, fix_batch_dft);
-                    llama_batch_free(fix_batch_dft);
+                    llama_decode(spec_ctx->ctx_tgt, fix_batch);
+                    llama_batch_free(fix_batch);
+
+                    // 3. Do the same for the draft context ONLY if using standard speculation
+                    if (spec_ctx->ctx_dft && !spec_ctx->params.is_mtp) {
+                        llama_memory_t mem_dft = llama_get_memory(spec_ctx->ctx_dft);
+                        llama_memory_seq_rm(mem_dft, pair.first, pair.second.current_pos, -1);
+                        llama_state_seq_set_data(spec_ctx->ctx_dft, pair.second.ckpt_dft.data(),
+                                                 pair.second.ckpt_dft.size(), pair.first);
+
+                        llama_batch fix_batch_dft = llama_batch_init(redecode_count, 0, 1);
+                        spec_batch_add(&fix_batch_dft, pair.second.current_token, pair.second.current_pos,
+                                       { pair.first }, true);
+
+                        for (int i = 0; i < accepted; i++) {
+                            spec_batch_add(&fix_batch_dft, pair.second.draft_tokens[i], pair.second.current_pos + i + 1,
+                                           { pair.first }, true);
+                        }
+                        llama_decode(spec_ctx->ctx_dft, fix_batch_dft);
+                        llama_batch_free(fix_batch_dft);
+                    }
                 }
             }
         }
