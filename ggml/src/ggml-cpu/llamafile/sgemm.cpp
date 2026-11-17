@@ -69,7 +69,7 @@
 #define VECTOR_REGISTERS 16
 #endif
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
 #define LMUL 4
 #endif
 
@@ -180,7 +180,7 @@ inline float32x4_t madd(float32x4_t a, float32x4_t b, float32x4_t c) {
 }
 #endif
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
 template <> inline vfloat32m1_t madd(vfloat32m1_t a, vfloat32m1_t b, vfloat32m1_t c) {
     return __riscv_vfmacc_vv_f32m1(c, a, b, __riscv_vsetvlmax_e32m1());
 }
@@ -228,7 +228,7 @@ template <> inline vfloat32m8_t madd(vbfloat16m4_t a, vbfloat16m4_t b, vfloat32m
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // VECTORIZED HORIZONTAL SUM
 
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) || defined(_M_ARM64) || defined(_M_ARM64EC)
 inline float hsum(float32x4_t x) {
     return vaddvq_f32(x);
 }
@@ -277,7 +277,7 @@ inline float hsum(__m512 x) {
 }
 #endif // __AVX512F__
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
 inline float hsum(vfloat32m1_t x) {
     return __riscv_vfmv_f_s_f32m1_f32(
         __riscv_vfredusum_vs_f32m1_f32m1(x, __riscv_vfmv_v_f_f32m1(0, 1), __riscv_vsetvlmax_e32m1()));
@@ -325,6 +325,12 @@ template <> inline float32x4_t load(const ggml_fp16_t * p) {
     }
 
     return vec_xl(0, (const float *)(tmp));
+}
+template <> inline float32x4_t load(const ggml_bf16_t * p) {
+    uint64_t bits;
+    memcpy(&bits, p, sizeof(bits));
+    const uint64x2_t v_bits = { bits, bits };
+    return GGML_BF16_TO_F32_HI((GGML_BF16_VEC) v_bits);
 }
 template <> inline float32x4_t load(const float * p) {
     return vec_xl(0, p);
@@ -384,7 +390,81 @@ template <> inline __m256bh load(const float *p) {
 }
 #endif
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+template <typename T, typename U> T load_partial(const U *, int);
+template <typename T> T load_partial_u16(const void *, int);
+
+template <> inline __m128i load_partial_u16(const void *p, int n) {
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+    return _mm_maskz_loadu_epi16((1u << n) - 1, p);
+#else
+    const __m128i index = _mm_setr_epi32(0, 1, 2, 3);
+    const __m128i pairs = _mm_set1_epi32(n / 2);
+    __m128i v = _mm_castps_si128(_mm_maskload_ps((const float *)p, _mm_cmpgt_epi32(pairs, index)));
+    if (n & 1) {
+        uint16_t last;
+        memcpy(&last, (const char *)p + 2*(n - 1), sizeof(last));
+        v = _mm_or_si128(v, _mm_and_si128(_mm_cmpeq_epi32(pairs, index), _mm_set1_epi32(last)));
+    }
+    return v;
+#endif
+}
+
+template <> inline __m256 load_partial(const float *p, int n) {
+    const __m256 index = _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7);
+    return _mm256_maskload_ps(p, _mm256_castps_si256(_mm256_cmp_ps(index, _mm256_set1_ps(n), _CMP_LT_OQ)));
+}
+
+#if defined(__F16C__)
+template <> inline __m256 load_partial(const ggml_fp16_t *p, int n) {
+    return _mm256_cvtph_ps(load_partial_u16<__m128i>(p, n));
+}
+#endif
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+template <> inline __m256 load_partial(const ggml_bf16_t *p, int n) {
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(load_partial_u16<__m128i>(p, n)), 16));
+}
+#endif
+
+#if defined(__AVX512F__)
+template <> inline __m256i load_partial_u16(const void *p, int n) {
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+    return _mm256_maskz_loadu_epi16((1u << n) - 1, p);
+#else
+    const __m256i index = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i pairs = _mm256_set1_epi32(n / 2);
+    __m256i v = _mm256_maskload_epi32((const int *)p, _mm256_cmpgt_epi32(pairs, index));
+    if (n & 1) {
+        uint16_t last;
+        memcpy(&last, (const char *)p + 2*(n - 1), sizeof(last));
+        v = _mm256_or_si256(v, _mm256_and_si256(_mm256_cmpeq_epi32(pairs, index), _mm256_set1_epi32(last)));
+    }
+    return v;
+#endif
+}
+
+template <> inline __m512 load_partial(const float *p, int n) {
+    return _mm512_maskz_loadu_ps((1u << n) - 1, p);
+}
+
+template <> inline __m512 load_partial(const ggml_fp16_t *p, int n) {
+    return _mm512_cvtph_ps(load_partial_u16<__m256i>(p, n));
+}
+
+template <> inline __m512 load_partial(const ggml_bf16_t *p, int n) {
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(load_partial_u16<__m256i>(p, n)), 16));
+}
+#endif
+
+#if defined(__AVX512BF16__)
+template <> inline __m512bh load_partial(const ggml_bf16_t *p, int n) {
+    return (__m512bh) _mm512_maskz_loadu_epi16((uint64_t(1) << n) - 1, p);
+}
+#endif
+#endif
+
+#if defined(__riscv_v)
 template <> inline vfloat32m1_t load(const float *p) {
     return __riscv_vle32_v_f32m1(p, __riscv_vsetvlmax_e32m1());
 }
@@ -429,7 +509,7 @@ template <> inline vbfloat16m4_t load(const ggml_bf16_t *p) {
 }
 #endif
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
 template <typename T> T set_zero();
 
 template <> inline vfloat32m1_t set_zero() {
@@ -446,7 +526,7 @@ template <> inline vfloat32m8_t set_zero() {
 }
 #endif
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
 template <typename T> size_t vlmax() {
     if constexpr (std::is_same_v<T, vfloat32m1_t>) { return  __riscv_vsetvlmax_e32m1(); }
     else if constexpr (std::is_same_v<T, vfloat32m2_t>) { return  __riscv_vsetvlmax_e32m2(); }
@@ -492,8 +572,10 @@ class tinyBLAS {
     }
 
     bool matmul(int64_t m, int64_t n) {
+#if !defined(__AVX__) && !defined(__AVX2__) && !defined(__AVX512F__)
         if (k % KN != 0)
             return false;
+#endif
         // compute RM for only need tile with size RM&RM-1
 #if VECTOR_REGISTERS == 32
         if (m % 16 == 0 && (m/16 >= params->nth)) {
@@ -548,7 +630,7 @@ class tinyBLAS {
     template <int RM, int RN>
     inline void gemm_bloc(int64_t ii, int64_t jj) {
         D Cv[RN][RM] = {};
-        for (int64_t l = 0; l < k; l += KN) {
+        for (int64_t l = 0; l + KN <= k; l += KN) {
             // help compiler for op order.
             if constexpr (RM <= RN) {
                 V Av[RM];
@@ -574,6 +656,21 @@ class tinyBLAS {
                 }
             }
         }
+#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+        const int64_t rem = k % KN;
+        if (rem != 0) {
+            V Av[RM];
+            for (int64_t i = 0; i < RM; ++i) {
+                Av[i] = load_partial<V>(A + lda * (ii + i) + k - rem, rem);
+            }
+            for (int64_t j = 0; j < RN; ++j) {
+                V Bv = load_partial<V>(B + ldb * (jj + j) + k - rem, rem);
+                for (int64_t i = 0; i < RM; ++i) {
+                    Cv[j][i] = madd(Av[i], Bv, Cv[j][i]);
+                }
+            }
+        }
+#endif
         for (int64_t j = 0; j < RN; ++j)
             for (int64_t i = 0; i < RM; ++i)
                 C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
@@ -641,7 +738,7 @@ class tinyBLAS {
     const int64_t ldc;
 };
 
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
 template <typename D, typename V, typename TA, typename TB, typename TC>
 class tinyBLAS_RVV {
   public:
@@ -1210,6 +1307,174 @@ class tinyBLAS_RVV {
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // QUANT ZERO MATRIX MULTIPLICATION
+
+#if defined(__VXE__) || defined(__VXE2__)
+template <typename TA, typename TB>
+class tinyBLAS_Q0_VXE {
+  public:
+    tinyBLAS_Q0_VXE(int64_t k,
+                    const TA * A, int64_t lda,
+                    const TB * B, int64_t ldb,
+                    float * C, int64_t ldc,
+                    int32_t ith, int32_t nth)
+        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
+    }
+
+    void matmul(int64_t m, int64_t n) {
+        constexpr int32_t tile_size = 2;
+        const int64_t row_tiles = m / tile_size;
+        const int64_t tiles     = row_tiles * (n / tile_size);
+        const int64_t duty      = (tiles + nth - 1) / nth;
+        const int64_t start     = duty * ith;
+        const int64_t end       = MIN(start + duty, tiles);
+
+        for (int64_t job = start; job < end; ++job) {
+            const int64_t ii = tile_size * (job % row_tiles);
+            const int64_t jj = tile_size * (job / row_tiles);
+
+            float sum_min[tile_size][tile_size] = {};
+            float32x4_t v_sum[tile_size][tile_size] = {};
+
+            for (int64_t l = 0; l < k; ++l) {
+                int8x16_t v_xl[tile_size], v_xh[tile_size];
+                int8x16_t v_yl[tile_size], v_yh[tile_size];
+
+                float x_scale[tile_size], y_scale[tile_size];
+                float x_min[tile_size], y_sum[tile_size];
+
+                for (int32_t i = 0; i < tile_size; ++i) {
+                    const TA & x = A[lda * (ii + i) + l];
+                    const TB & y = B[ldb * (jj + i) + l];
+
+                    load(x, v_xl[i], v_xh[i]);
+                    load(y, v_yl[i], v_yh[i]);
+
+                    x_scale[i] = unhalf(x.d);
+                    y_scale[i] = unhalf(y.d);
+                    x_min[i] = min(x);
+                    y_sum[i] = sum(y);
+                }
+
+                for (int32_t j = 0; j < tile_size; ++j) {
+                    for (int32_t i = 0; i < tile_size; ++i) {
+                        const int32x4_t v_dot = dot(v_xl[i], v_xh[i], v_yl[j], v_yh[j]);
+                        const float32x4_t v_scale = vec_splats(x_scale[i] * y_scale[j]);
+                        v_sum[j][i] = vec_madd(vec_float(v_dot), v_scale, v_sum[j][i]);
+                        if (has_min) {
+                            sum_min[j][i] += x_min[i] * y_sum[j];
+                        }
+                    }
+                }
+            }
+
+            for (int32_t j = 0; j < tile_size; ++j) {
+                for (int32_t i = 0; i < tile_size; ++i) {
+                    C[ldc * (jj + j) + ii + i] = hsum(v_sum[j][i]) + sum_min[j][i];
+                }
+            }
+        }
+    }
+
+  private:
+    // Q4_1 and Q5_1 weights have a block minimum, it pairs with the Q8_1 block sum.
+    static constexpr bool has_min = std::is_same<TB, block_q8_1>::value;
+
+    static int32x4_t dot_s8_wide(int8x16_t v_x, int8x16_t v_y) {
+        const int16x8_t v_even = vec_mule(v_x, v_y);
+        const int16x8_t v_odd  = vec_mulo(v_x, v_y);
+        // Two (-128) * (-128) products can overflow a signed 16-bit sum.
+        return vec_unpackh(v_even) + vec_unpackl(v_even) + vec_unpackh(v_odd) + vec_unpackl(v_odd);
+    }
+
+    static int32x4_t dot(int8x16_t v_xl, int8x16_t v_xh, int8x16_t v_yl, int8x16_t v_yh) {
+        // block_q8_0 path
+        if (std::is_same<TA, block_q8_0>::value) {
+            return dot_s8_wide(v_xl, v_yl) + dot_s8_wide(v_xh, v_yh);
+        }
+
+        // block_q8_1 path
+        const int16x8_t v_one = vec_splats((int16_t)1);
+        const int16x8_t v_xy = vec_meadd(v_xl, v_yl, vec_moadd(v_xl, v_yl, vec_meadd(v_xh, v_yh, vec_mulo(v_xh, v_yh))));
+        return vec_meadd(v_xy, v_one, vec_mulo(v_xy, v_one));
+    }
+
+    static void load(const block_q4_0 & x, int8x16_t & v_xl, int8x16_t & v_xh) {
+        const uint8_t * x_qs = x.qs;
+        const uint8x16_t v_x = vec_xl(0, x_qs);
+        v_xl = (int8x16_t)vec_and(v_x, vec_splats((uint8_t)0x0F)) - vec_splats((int8_t)8);
+        v_xh = (int8x16_t)vec_sr(v_x, 4) - vec_splats((int8_t)8);
+    }
+
+    static void load(const block_q4_1 & x, int8x16_t & v_xl, int8x16_t & v_xh) {
+        const uint8_t * x_qs = x.qs;
+        const uint8x16_t v_x = vec_xl(0, x_qs);
+        v_xl = (int8x16_t)vec_and(v_x, vec_splats((uint8_t)0x0F));
+        v_xh = (int8x16_t)vec_sr(v_x, 4);
+    }
+
+    static void load(const block_q5_0 & x, int8x16_t & v_xl, int8x16_t & v_xh) {
+        const uint8_t * x_qs = x.qs;
+        const uint8x16_t v_x = vec_xl(0, x_qs);
+        uint8x16_t v_qhl, v_qhh;
+        load_qh(x.qh, v_qhl, v_qhh);
+        v_xl = (int8x16_t)vec_or(vec_and(v_x, vec_splats((uint8_t)0x0F)), v_qhl) - vec_splats((int8_t)16);
+        v_xh = (int8x16_t)vec_or(vec_sr(v_x, 4), v_qhh) - vec_splats((int8_t)16);
+    }
+
+    static void load(const block_q5_1 & x, int8x16_t & v_xl, int8x16_t & v_xh) {
+        const uint8_t * x_qs = x.qs;
+        const uint8x16_t v_x = vec_xl(0, x_qs);
+        uint8x16_t v_qhl, v_qhh;
+        load_qh(x.qh, v_qhl, v_qhh);
+        v_xl = (int8x16_t)vec_or(vec_and(v_x, vec_splats((uint8_t)0x0F)), v_qhl);
+        v_xh = (int8x16_t)vec_or(vec_sr(v_x, 4), v_qhh);
+    }
+
+    static void load(const block_q8_0 & x, int8x16_t & v_xl, int8x16_t & v_xh) {
+        const int8_t * x_qs = x.qs;
+        v_xl = vec_xl(0, x_qs);
+        v_xh = vec_xl(0, x_qs + QK8_0 / 2);
+    }
+
+    static void load(const block_q8_1 & x, int8x16_t & v_xl, int8x16_t & v_xh) {
+        const int8_t * x_qs = x.qs;
+        v_xl = vec_xl(0, x_qs);
+        v_xh = vec_xl(0, x_qs + QK8_1 / 2);
+    }
+
+    // expand the 32 high bits to one byte each, with value 0 or 16
+    static void load_qh(const uint8_t * qh, uint8x16_t & v_qhl, uint8x16_t & v_qhh) {
+        // qh is a native 32-bit value, on big-endian its lowest bits are in byte 3
+        const uint8x16_t v_bytel = { 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2 };
+        const uint8x16_t v_byteh = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+        const uint8x16_t v_bit   = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
+
+        uint32_t tmp;
+        memcpy(&tmp, qh, sizeof(tmp));
+        const uint8x16_t v_qh = (uint8x16_t)vec_splats(tmp);
+
+        v_qhl = (uint8x16_t)vec_cmpeq(vec_and(vec_perm(v_qh, v_qh, v_bytel), v_bit), v_bit) & vec_splats((uint8_t)16);
+        v_qhh = (uint8x16_t)vec_cmpeq(vec_and(vec_perm(v_qh, v_qh, v_byteh), v_bit), v_bit) & vec_splats((uint8_t)16);
+    }
+
+    static float min(const block_q4_1 & x) { return unhalf(x.m); }
+    static float min(const block_q5_1 & x) { return unhalf(x.m); }
+    template <typename T> static float min(const T &) { return 0.0f; }
+
+    static float sum(const block_q8_0 &  ) { return 0.0f;        }
+    static float sum(const block_q8_1 & y) { return unhalf(y.s); }
+
+    const TA * const A;
+    const TB * const B;
+    float * const C;
+    const int64_t k;
+    const int64_t lda;
+    const int64_t ldb;
+    const int64_t ldc;
+    const int32_t ith;
+    const int32_t nth;
+};
+#endif
 
 #if defined(__ARM_FEATURE_DOTPROD)
 template <typename TA>
@@ -3867,7 +4132,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             params->ith, params->nth};
         tb.matmul(m, n);
         return true;
-#elif defined(__riscv_v_intrinsic)
+#elif defined(__riscv_v)
     #if LMUL == 1
         tinyBLAS_RVV<vfloat32m1_t, vfloat32m1_t, float, float, float> tb{ params,
             k, (const float *)A, lda,
@@ -3910,6 +4175,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
 #elif defined(__AVX2__)
         if (Btype == GGML_TYPE_BF16) {
             tinyBLAS<8, __m256, __m256, ggml_bf16_t, ggml_bf16_t, float> tb{ params, k,
+                (const ggml_bf16_t *)A, lda,
+                (const ggml_bf16_t *)B, ldb,
+                (float *)C, ldc};
+            return tb.matmul(m, n);
+        }
+#elif defined(__VXE__) || defined(__VXE2__)
+        if (Btype == GGML_TYPE_BF16) {
+            tinyBLAS<4, float32x4_t, float32x4_t, ggml_bf16_t, ggml_bf16_t, float> tb{ params, k,
                 (const ggml_bf16_t *)A, lda,
                 (const ggml_bf16_t *)B, ldb,
                 (float *)C, ldc};
@@ -3963,11 +4236,25 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                 (float *)C, ldc};
             return tb.matmul(m, n);
         }
+        if (Btype == GGML_TYPE_F32) {
+            tinyBLAS<16, __m512, __m512, ggml_fp16_t, float, float> tb{ params, k,
+                (const ggml_fp16_t *)A, lda,
+                (const float *)B, ldb,
+                (float *)C, ldc};
+            return tb.matmul(m, n);
+        }
 #elif (defined(__AVX__) || defined(__AVX2__)) && defined(__F16C__)
         if (Btype == GGML_TYPE_F16) {
             tinyBLAS<8, __m256, __m256, ggml_fp16_t, ggml_fp16_t, float> tb{ params, k,
                 (const ggml_fp16_t *)A, lda,
                 (const ggml_fp16_t *)B, ldb,
+                (float *)C, ldc};
+            return tb.matmul(m, n);
+        }
+        if (Btype == GGML_TYPE_F32) {
+            tinyBLAS<8, __m256, __m256, ggml_fp16_t, float, float> tb{ params, k,
+                (const ggml_fp16_t *)A, lda,
+                (const float *)B, ldb,
                 (float *)C, ldc};
             return tb.matmul(m, n);
         }
@@ -4057,6 +4344,17 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             params->ith, params->nth};
         tb.matmul(m, n);
         return true;
+#elif defined(__VXE__) || defined(__VXE2__)
+        if (m % 2 || n % 2) {
+            return false;
+        }
+        tinyBLAS_Q0_VXE<block_q8_0, block_q8_0> tb{
+            k, (const block_q8_0 *)A, lda,
+            (const block_q8_0 *)B, ldb,
+            (float *)C, ldc,
+            params->ith, params->nth};
+        tb.matmul(m, n);
+        return true;
 #elif defined(__MMA__)
     //TO-DO: Remove this condition once gemv forwarding is enabled.
         if (n < 8 && n != 4)
@@ -4094,6 +4392,17 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             params->ith, params->nth};
         tb.matmul(m, n);
         return true;
+#elif defined(__VXE__) || defined(__VXE2__)
+        if (m % 2 || n % 2) {
+            return false;
+        }
+        tinyBLAS_Q0_VXE<block_q4_0, block_q8_0> tb{
+            k, (const block_q4_0 *)A, lda,
+            (const block_q8_0 *)B, ldb,
+            (float *)C, ldc,
+            params->ith, params->nth};
+        tb.matmul(m, n);
+        return true;
 #elif defined(__MMA__)
     //TO-DO: Remove this condition once gemv forwarding is enabled.
         if (n < 8 && n != 4)
@@ -4119,6 +4428,57 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         tinyBLAS_Q0_AVX<block_q5_0, block_q8_0, float> tb{
             k, (const block_q5_0 *)A, lda,
             (const block_q8_0 *)B, ldb,
+            (float *)C, ldc,
+            params->ith, params->nth};
+        tb.matmul(m, n);
+        return true;
+#elif defined(__VXE__) || defined(__VXE2__)
+        if (m % 2 || n % 2) {
+            return false;
+        }
+        tinyBLAS_Q0_VXE<block_q5_0, block_q8_0> tb{
+            k, (const block_q5_0 *)A, lda,
+            (const block_q8_0 *)B, ldb,
+            (float *)C, ldc,
+            params->ith, params->nth};
+        tb.matmul(m, n);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q4_1: {
+        if (Btype != GGML_TYPE_Q8_1) {
+            return false;
+        }
+#if defined(__VXE__) || defined(__VXE2__)
+        if (m % 2 || n % 2) {
+            return false;
+        }
+        tinyBLAS_Q0_VXE<block_q4_1, block_q8_1> tb{
+            k, (const block_q4_1 *)A, lda,
+            (const block_q8_1 *)B, ldb,
+            (float *)C, ldc,
+            params->ith, params->nth};
+        tb.matmul(m, n);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q5_1: {
+        if (Btype != GGML_TYPE_Q8_1) {
+            return false;
+        }
+#if defined(__VXE__) || defined(__VXE2__)
+        if (m % 2 || n % 2) {
+            return false;
+        }
+        tinyBLAS_Q0_VXE<block_q5_1, block_q8_1> tb{
+            k, (const block_q5_1 *)A, lda,
+            (const block_q8_1 *)B, ldb,
             (float *)C, ldc,
             params->ith, params->nth};
         tb.matmul(m, n);
